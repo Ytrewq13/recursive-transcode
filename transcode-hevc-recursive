@@ -1,0 +1,208 @@
+#!/bin/sh
+
+IFS=$'\n'
+
+# Usage: transcode.sh
+# TODO: read file list from a config file?
+
+# Initialise configuration variables with defaults
+skip_already_hevc=0
+write_log_file=0
+log_file_name=transcode.log
+write_err_file=1
+err_file_name=transcoding_errors.log
+crf=28
+max_duration_difference_ms=500
+
+# TODO: dynamically determine how many NVENC ASICs the GPU has
+gpu_nvenc_asic_count=2
+
+
+print_usage() {
+    cat <<EOF
+Usage: transcode.sh options
+
+Where 'options' can be:
+    -h | -? | --help
+        Print this usage strung and then exit
+    --print_command
+        Print the 'ffmpeg' command which would be run on each file (useful for
+        copy-pasting)
+    -crf CRF | --crf CRF | -crf=CRF | --crf=CRF
+        Use CRF as the Constant Rate Factor / Constant Quality value
+    --skip_hevc
+        When encountering a video file already encoded in HEVC format (h265
+        codec), do not process that file
+    --write_log
+        Write general information to a log file
+    --no_write_log
+        Do not write general information to a log file (instead print it to
+        stdout)
+    --write_err
+        Write error information to a log file
+    --no_write_err
+        Do not write error information to a log file (instead print it to
+        stdout)
+EOF
+}
+
+print_command() {
+    echo ffmpeg -y -loglevel info -hide_banner -hwaccel cuda -i INPUT -c copy -c:v hevc_nvenc -b:v 0 -maxrate:v 1M -bufsize:v 2M -preset:v slow -rc:v vbr -cq:v "$crf" -rc-lookahead:v 32 DESTINATION
+}
+
+# TODO: Add more control options
+while :; do
+    case $1 in
+        -h|-\?|--help)
+            print_usage
+            exit
+            ;;
+        --print_command)
+            print_command
+            exit
+            ;;
+        -crf|--crf)
+            crf="$2"
+            shift 2
+            ;;
+        -crf=*|--crf=*)
+            crf="${1#*=}"
+            shift
+            ;;
+        --skip_hevc)
+            skip_already_hevc=1
+            shift
+            ;;
+        --write_log)
+            write_log_file=1
+            shift
+            ;;
+        --no_write_log)
+            write_log_file=0
+            shift
+            ;;
+        --write_err)
+            write_err_file=1
+            shift
+            ;;
+        --no_write_err)
+            write_err_file=0
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+export crf write_log_file write_err_file skip_already_hevc max_duration_difference_ms
+
+log() {
+    if [ -z "$log_file_path" ]; then
+        printf "$@"
+    else
+        printf "$@" >> "$log_file_path"
+    fi
+}
+export -f log
+
+log_error() {
+    printf "$@"
+    if [ -n "$err_file_path" ]; then
+        printf "$@" >> "$err_file_path"
+    fi
+}
+export -f log_error
+
+transcode_single_file() {
+    src="$1"
+    quality="$2"
+    dest="$3"
+    ffmpeg -y -loglevel info -hide_banner -hwaccel cuda -i "$src" -c copy -c:v hevc_nvenc -b:v 0 -maxrate:v 1M -bufsize:v 2M -preset:v slow -rc:v vbr -cq:v "$quality" -rc-lookahead:v 32 "$dest"
+}
+export -f transcode_single_file
+
+process_single_file() {
+    file="$1"
+    log "[%s]: Start processing file...\n" "$file"
+    original_file_size="$(du -b "$file" | cut -f1)"
+    log "[%s]: File size %s (%d bytes)\n" "$file" "$(numfmt --suffix=B --to=iec-i "$original_file_size")" "$original_file_size"
+    original_duration="$(mediainfo --Inform="Video;%Duration%" "$file" | cut -d. -f1)"
+    original_duration_seconds=$(( original_duration / 100 ))
+    log "[%s]: Duration: %d seconds\n" "$file" "$original_duration_seconds"
+    original_format="$(mediainfo --Inform="Video;%Format%" "$file")"
+
+    if [ "$original_format" = "HEVC" ]; then
+        if (( skip_already_hevc )); then
+            log "[%s]: File is already HEVC, skipping...\n" "$file"
+            return
+        else
+            log "[%s]: File is already HEVC\n" "$file"
+        fi
+    fi
+
+    log "[%s]: Transcoding with CRF=%d...\n" "$file" "$crf"
+    outfile="$tmpdir/$(basename "$file")"
+    transcode_single_file "$file" "$crf" "$outfile"
+
+    new_file_size="$(du -b "$outfile" | cut -f1)"
+    log "[%s]: Output file size %s (%d bytes)\n" "$file" "$(numfmt --suffix=B --to=iec-i "$new_file_size")" "$new_file_size"
+    new_duration="$(mediainfo --Inform="Video;%Duration%" "$outfile" | cut -d. -f1)"
+    if [ -z "$new_duration" ]; then
+        log_error "[%s]: Failed to get duration of transcode output!!\n" "$file"
+        rm -f "$outfile"
+        return
+    fi
+    duration_difference=$(( original_duration - new_duration ))
+    duration_difference=${duration_difference#-}
+    if [ "$duration_difference" -gt "$max_duration_difference_ms" ]; then
+        log_error "[%s]: Result duration differs from original duration by more than 100 milliseconds!!\n" "$file"
+        rm -f "$outfile"
+        return
+    fi
+    if [ $new_file_size -gt $original_file_size ]; then
+        log_error "[%s]: Result file larger than input file!!\n" "$file"
+        rm -f "$outfile"
+        return
+    fi
+    saved_bytes=$(( original_file_size - new_file_size ))
+
+    # Write saved bytes to file
+    echo "$saved_bytes" >> "$saved_bytes_file"
+
+    log "[%s]: Saved %s\n" "$file" "$(numfmt --suffix=B --to=iec-i "$saved_bytes")"
+    mv "$outfile" "$file"
+    rm -f "$outfile"
+}
+# Export the transcode function (needed for GNU parallel)
+export -f process_single_file
+
+
+cleanup() {
+    [ -n "$tmpdir" ] && [ -d "$tmpdir" ] && rm -rf "$tmpdir"
+    exit
+}
+
+trap cleanup SIGINT
+
+export tmpdir=$(mktemp -d)
+
+export saved_bytes_file="$tmpdir/saved_bytes_log"
+
+(( write_log_file )) && export log_file_path="$tmpdir/$log_file_name"
+(( write_err_file )) && export err_file_path="$tmpdir/$err_file_name"
+
+# Run the transcodes (in parallel - 2 at once)
+find ./ -type f \( -name "*.mp4" \) -o \( -name "*.mkv" \) -o \( -name "*.avi" \) | sort | parallel --jobs "$gpu_nvenc_asic_count" --bar process_single_file
+
+
+total_saved_bytes="$(awk 'BEGIN {n=0} {n+=$1} END {print n}' "$saved_bytes_file")"
+
+log "\n\n"
+log "Finished transcoding\n"
+log "Saved %s in total\n" "$(numfmt --suffix=B --to=iec-i "$total_saved_bytes")"
+
+[ -n "$log_file_path" ] && [ -f "$log_file_path" ] && mv "$log_file_path" "./$log_file_name"
+[ -n "$err_file_path" ] && [ -f "$err_file_path" ] && mv "$err_file_path" "./$err_file_name"
+
+[ -n "$tmpdir" ] && [ -d "$tmpdir" ] && rm -rf "$tmpdir"
